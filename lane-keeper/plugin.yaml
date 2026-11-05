@@ -1,0 +1,49 @@
+name: lane-keeper
+version: "0.1.0"
+manifest_version: 2
+api_version: 1
+description: "Keeps your agent on your few active lanes. New ideas are saved as dormant instead of quietly becoming work, only you can promote one, and stale active lanes get called out."
+author: Morris (MindSprout)
+license: MIT
+homepage: https://github.com/morrismindsprout-dev/hermes-lane-keeper
+requires_hermes: ">=0.22"
+tags: [focus, projects, productivity, ideas, accountability]
+provides_tools:
+  - lane_list
+  - lane_capture
+  - lane_checkpoint
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+config_schema:
+  lanes_dir:
+    type: str
+    default: ""
+    label: "Lanes folder"
+    description: "Where lane markdown files live. Empty = <HERMES_HOME>/plugin-data/lane-keeper/lanes. Point it at a notes or Obsidian folder to edit lanes by hand."
+  max_active:
+    type: int
+    default: 3
+    label: "Max active lanes"
+    description: "Promoting past this cap requires parking an active lane (/lanes promote X --park Y)."
+  stale_days:
+    type: int
+    default: 7
+    label: "Stale after (days)"
+    description: "An active lane with no log entry for this long is flagged as stale."
+  inject:
+    type: str
+    choices: [every_turn, first_turn, "off"]
+    default: every_turn
+    label: "Show lanes to the agent"
+    description: "How often the live lane summary is added to the agent's context."
+  dormant_in_context:
+    type: int
+    default: 15
+    label: "Dormant titles shown to the agent"
+    description: "How many dormant lane titles the agent sees, so it can spot duplicates. 0 = count only."
+  guard_lane_files:
+    type: bool
+    default: true
+    label: "Guard lane files"
+    description: "Block the agent from editing lane files through file or terminal tools. Lane status is the user's call."
