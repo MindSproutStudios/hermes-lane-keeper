@@ -1,11 +1,17 @@
-"""Lane Keeper core: settings, the per-turn context block, and the /lanes command.
+"""Lane Keeper core: settings, what the model sees, and the /lanes command.
 
-The command surface (``/lanes`` in chat, ``hermes lanes`` in a terminal) is
-the only place lane *status* changes. The model gets capture and checkpoint
-tools, but no tool can promote, park or archive a lane.
+What the model sees, cache-safe:
+- system_section(): rules + a lane snapshot, rendered ONCE per session through
+  register_system_prompt_section, then frozen (the prompt cache stays valid).
+- turn_delta(): a one-line pre_llm_call note, only when lanes changed since the
+  snapshot (a promotion, a capture, a park). None otherwise.
+
+The /lanes slash command is the only place lane *status* changes. The
+`hermes lanes` CLI is read-only, so an agent with a terminal can't promote.
 """
 from __future__ import annotations
 
+import hashlib
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,10 +23,12 @@ DEFAULTS = {
     "lanes_dir": "",
     "max_active": 3,
     "stale_days": 7,
-    "inject": "every_turn",      # every_turn | first_turn | off
+    "inject": "changes",         # changes | every_turn | off
     "dormant_in_context": 15,
     "guard_lane_files": True,
 }
+SNAPSHOT_MAX = 2000
+UNATTENDED_PLATFORMS = {"cron", "batch", "webhook"}
 
 
 @dataclass
@@ -40,9 +48,11 @@ class Settings:
             except (TypeError, ValueError):
                 return DEFAULTS[key]
         raw_dir = str(get("lanes_dir", "") or "").strip()
-        inject = str(get("inject", DEFAULTS["inject"]) or "every_turn").strip().lower()
-        if inject not in {"every_turn", "first_turn", "off"}:
-            inject = "every_turn"
+        inject = str(get("inject", DEFAULTS["inject"]) or "changes").strip().lower()
+        if inject == "first_turn":
+            inject = "changes"
+        if inject not in {"changes", "every_turn", "off"}:
+            inject = "changes"
         guard = get("guard_lane_files", True)
         return cls(
             lanes_dir=Path(raw_dir).expanduser() if raw_dir else default_dir(),
@@ -54,17 +64,14 @@ class Settings:
         )
 
 
-# ---------------------------------------------------------------------------
-# Rules the model follows (frozen into the system prompt once per session).
-# ---------------------------------------------------------------------------
 RULES = """\
-Lane Keeper is on. The user keeps a few ACTIVE lanes (current commitments) and a vault of DORMANT lanes (saved ideas that are not commitments). The live lane list arrives with each user message in a [Lane Keeper] block.
+Lane Keeper is on. The user keeps a few ACTIVE lanes (current commitments) and a vault of DORMANT lanes (saved ideas that are not commitments). The snapshot below was taken when this session started; if lanes change mid-session, a one-line [Lane Keeper] update arrives with the user's message.
 - Treat only active lanes as current work. Never treat a dormant or archived lane as a commitment or nag about it.
-- When the user brings up a new project or idea that does not fit an active lane, save it with lane_capture (it lands dormant) and confirm in one short line. If a close dormant lane already exists, add to it with lane_checkpoint instead of duplicating it.
-- Do not quietly turn a new idea into active work. If the user explicitly asks you to work on it now, do the work, but say it is outside the active lanes and ask whether they want to promote it.
-- Only the user changes lane status, by typing /lanes promote, /lanes park or /lanes archive. You have no tool for that, must not edit lane files directly, and must not run the `hermes lanes` CLI or change Lane Keeper settings. Never offer to promote a lane yourself; point the user to the command. When promotion is at the active-lane cap, name which active lane would have to park.
+- When the user brings up a new project or idea that does not fit an active lane, save it with lane_capture (it lands dormant) and confirm in one short line. If a close lane already exists, add to it with lane_checkpoint instead of duplicating it. Ordinary requests, questions and tasks inside an existing lane are not new ideas: do not capture them.
+- Do not quietly turn a new idea into active work. If the user explicitly asks you to work on it now, do the work, but say it is outside the active lanes.
+- Only the user changes lane status, by typing /lanes promote, /lanes park or /lanes archive in chat. You have no tool for that, must not edit lane files or Lane Keeper's data, and must not change its settings. Never offer to promote a lane yourself; point the user to the command. When promotion is at the active-lane cap, name which active lane would have to park.
 - When a decision, blocker, result or next action is settled on a lane, record it with lane_checkpoint (one line; include next_action when it changes).
-- If the block flags a stale active lane, mention it once, briefly, at a natural point. Do not repeat it every turn."""
+- If the snapshot says to mention a stale lane or a status mismatch, do it once, briefly, at a natural point."""
 
 
 def _ago(days: Optional[int]) -> str:
@@ -77,29 +84,53 @@ def _ago(days: Optional[int]) -> str:
     return f"{days}d ago"
 
 
-def context_block(store: LaneStore, s: Settings, *, first_turn: bool) -> Optional[str]:
-    """Compact live state for the model. ``None`` when there are no lanes yet."""
+def fingerprint(store: LaneStore) -> str:
+    parts = sorted(f"{ln.slug}|{ln.status}|{ln.next_action}|{ln.mismatch}" for ln in store.all())
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+
+
+def _active_line(ln: Lane, s: Settings, ref, stale_note: str = "") -> str:
+    days = ln.age_days(ref)
+    nxt = ln.next_action or "(none set)"
+    return f"- {ln.title} [`{ln.slug}`]{stale_note} · updated {_ago(days)} | next: {nxt}"
+
+
+def snapshot(store: LaneStore, s: Settings, *, mark_stale: bool = True) -> str:
+    """Lane list for the model (≤ SNAPSHOT_MAX chars). Gives each stale notice once."""
     lanes = store.all()
     if not lanes:
-        if first_turn:
-            return ("[Lane Keeper] No lanes yet. When the user names projects or ideas, capture them "
-                    "with lane_capture; they can make one active with /lanes promote <name>.")
-        return None
+        return ("[Lane Keeper] No lanes yet. When the user names projects or ideas, capture them "
+                "with lane_capture; they can make one active with /lanes promote <name>.")
     ref = now()
     active = store.by_status(ACTIVE)
     dormant = store.by_status(DORMANT)
+    reg = store.registry
+    notified = reg.data["stale_notified"] if reg is not None else {}
     lines = [f"[Lane Keeper] Active lanes ({len(active)}/{s.max_active}):"]
     if not active:
         lines.append("- none: nothing is an active commitment right now")
-    stale = []
+    changed = False
     for ln in active:
         days = ln.age_days(ref)
-        flag = ""
+        note = ""
         if days is not None and days >= s.stale_days:
-            flag = f" ⚠ STALE {days}d"
-            stale.append(ln)
-        nxt = f" | next: {ln.next_action}" if ln.next_action else " | next: (none set)"
-        lines.append(f"- {ln.title} [`{ln.slug}`]{flag} · updated {_ago(days)}{nxt}")
+            stamp = ln.updated.isoformat() if ln.updated else "never"
+            if notified.get(ln.slug) != stamp:
+                note = f" ⚠ STALE {days}d (mention once)"
+                if mark_stale:
+                    notified[ln.slug] = stamp
+                    changed = True
+            else:
+                note = f" ⚠ stale {days}d (already mentioned)"
+        lines.append(_active_line(ln, s, ref, note))
+    if len(active) > s.max_active:
+        lines.append(f"OVER CAP: {len(active)} active vs a cap of {s.max_active}. A focus problem only the "
+                     "user can resolve with /lanes park. Do not pick for them.")
+    bad = [ln for ln in lanes if ln.mismatch]
+    if bad:
+        desc = "; ".join(f"`{ln.slug}` (file says {ln.file_status}, really {ln.status})" for ln in bad[:5])
+        lines.append(f"STATUS MISMATCH (mention once): lane files claim a status the user never set: {desc}. "
+                     "The real status stands. If the user meant it, they run /lanes promote.")
     if dormant and s.dormant_in_context:
         shown = dormant[: s.dormant_in_context]
         names = "; ".join(f"{ln.title} [`{ln.slug}`]" for ln in shown)
@@ -107,16 +138,65 @@ def context_block(store: LaneStore, s: Settings, *, first_turn: bool) -> Optiona
         lines.append(f"Dormant, saved but NOT commitments ({len(dormant)}): {names}{more}")
     elif dormant:
         lines.append(f"Dormant lanes saved: {len(dormant)} (not commitments).")
-    if len(active) > s.max_active:
-        lines.append(f"OVER CAP: {len(active)} active vs a cap of {s.max_active}. Treat this as a focus problem "
-                     "the user should resolve with /lanes park. Do not pick for them.")
-    if stale and first_turn:
-        lines.append("Stale active lanes exist. Mention them once, briefly.")
-    return "\n".join(lines)
+    if changed and reg is not None:
+        reg.save()
+    text = "\n".join(lines)
+    if len(text) > SNAPSHOT_MAX:
+        text = text[: SNAPSHOT_MAX - 40].rsplit("\n", 1)[0] + "\n(…more lanes: use lane_list)"
+    return text
+
+
+def _remember_session(store: LaneStore, session_id: str) -> None:
+    reg = store.registry
+    if reg is None or not session_id:
+        return
+    sessions = reg.data["sessions"]
+    sessions[session_id] = fingerprint(store)
+    if len(sessions) > 300:  # bounded: drop the oldest entries
+        for key in list(sessions)[: len(sessions) - 300]:
+            sessions.pop(key, None)
+    reg.save()
+
+
+def system_section(store: LaneStore, s: Settings, session_id: str = "") -> str:
+    text = RULES + "\n\n" + snapshot(store, s)
+    _remember_session(store, session_id)
+    return text
+
+
+def turn_delta(store: LaneStore, s: Settings, session_id: str) -> Optional[str]:
+    """One short update when lanes changed since this session's snapshot, else None."""
+    reg = store.registry
+    if reg is None or not session_id:
+        return None
+    fp = fingerprint(store)
+    prev = reg.data["sessions"].get(session_id)
+    if prev == fp:
+        return None
+    reg.data["sessions"][session_id] = fp
+    reg.save()
+    if prev is None:
+        return None  # session predates the plugin or its record; nothing to compare
+    active = store.by_status(ACTIVE)
+    act = "; ".join(f"{ln.title} [`{ln.slug}`] next: {ln.next_action or '(none)'}" for ln in active) or "none"
+    dormant = len(store.by_status(DORMANT))
+    note = f"[Lane Keeper] Lanes changed this session. Active now ({len(active)}/{s.max_active}): {act}. Dormant: {dormant}."
+    bad = [ln.slug for ln in store.all() if ln.mismatch]
+    if bad:
+        note += f" Status mismatch on: {', '.join(bad[:5])} (the real status stands)."
+    return note[:SNAPSHOT_MAX]
+
+
+def context_block(store: LaneStore, s: Settings, *, first_turn: bool) -> Optional[str]:
+    """Fallback for hosts without system-prompt sections, or inject=every_turn."""
+    if not store.all() and not first_turn:
+        return None
+    return snapshot(store, s, mark_stale=first_turn)
 
 
 # ---------------------------------------------------------------------------
-# /lanes command — shared by the chat slash command and `hermes lanes`.
+# /lanes command: the chat slash command can do everything; `hermes lanes`
+# in a terminal is read-only (see run_command(read_only=True)).
 # ---------------------------------------------------------------------------
 HELP = """\
 /lanes                         brief: active lanes, next actions, stale flags
@@ -162,6 +242,11 @@ def brief(store: LaneStore, s: Settings) -> str:
     if stale:
         out.append(f"\n⚠ {len(stale)} stale (no update in {s.stale_days}+ days): "
                    + ", ".join(ln.slug for ln in stale) + ". Push it forward, or park it.")
+    bad = [ln for ln in store.all() if ln.mismatch]
+    if bad:
+        out.append("\n🔒 Ignored status edits: these files claim a status you never set, so the real status stands: "
+                   + ", ".join(f"`{ln.slug}` (file: {ln.file_status}, real: {ln.status})" for ln in bad[:5])
+                   + ". If you meant it, use /lanes promote/park.")
     if dormant:
         recent = dormant[:5]
         out.append(f"\n💤 Dormant: {len(dormant)} saved, not committed. Newest: "
@@ -235,7 +320,11 @@ def _promote(store: LaneStore, s: Settings, args: list[str]) -> str:
     return msg
 
 
-def run_command(store: LaneStore, s: Settings, raw: str) -> str:
+WRITE_VERBS = {"new", "add", "capture", "promote", "park", "pause", "archive", "revive",
+               "unarchive", "next", "log", "note"}
+
+
+def run_command(store: LaneStore, s: Settings, raw: str, *, read_only: bool = False) -> str:
     try:
         args = shlex.split(raw or "")
     except ValueError:
@@ -243,6 +332,9 @@ def run_command(store: LaneStore, s: Settings, raw: str) -> str:
     if not args:
         return brief(store, s)
     verb, rest = args[0].lower(), args[1:]
+    if read_only and verb in WRITE_VERBS:
+        return (f"`hermes lanes {verb}` is read-only from a terminal, because an agent with shell "
+                f"access could otherwise run it. Type `/lanes {raw.strip()}` in a Hermes chat instead.")
     try:
         if verb in {"help", "-h", "--help"}:
             return HELP

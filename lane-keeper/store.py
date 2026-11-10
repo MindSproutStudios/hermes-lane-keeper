@@ -11,6 +11,7 @@ This module has no Hermes imports, so it can be unit-tested on its own.
 from __future__ import annotations
 
 import difflib
+import json
 import os
 import re
 import tempfile
@@ -75,6 +76,12 @@ class Lane:
     why: str = ""
     body: str = ""  # everything after the front matter, including the log
     extra: dict = field(default_factory=dict)  # unknown front-matter keys, preserved
+    file_status: str = ""  # what the markdown header claims; the registry decides
+
+    @property
+    def mismatch(self) -> bool:
+        """The file claims a status the registry never granted (e.g. a hand/agent edit)."""
+        return bool(self.file_status) and self.file_status != self.status
 
     # -- derived ---------------------------------------------------------
     def age_days(self, ref: Optional[datetime] = None) -> Optional[int]:
@@ -129,13 +136,13 @@ def parse_lane(path: Path) -> Lane:
     if not isinstance(meta, dict):
         meta = {}
     known = {"title", "status", "created", "updated", "next_action", "why"}
-    status = str(meta.get("status") or DORMANT).strip().lower()
-    if status not in STATUSES:
-        status = DORMANT  # unknown status never counts as an active commitment
+    raw_status = str(meta.get("status") or DORMANT).strip().lower()
+    status = raw_status if raw_status in STATUSES else DORMANT  # unknown never counts as active
     return Lane(
         slug=path.stem,
         title=str(meta.get("title") or path.stem.replace("-", " ").title()),
         status=status,
+        file_status=raw_status,
         created=_parse_ts(meta.get("created")),
         updated=_parse_ts(meta.get("updated")) or _parse_ts(meta.get("created")),
         next_action=str(meta.get("next_action") or ""),
@@ -145,9 +152,63 @@ def parse_lane(path: Path) -> Lane:
     )
 
 
+class Registry:
+    """Authoritative lane status, kept in the plugin's own data folder.
+
+    The markdown files are a readable mirror. If a file's header disagrees with
+    the registry (someone, or an agent, edited ``status: active`` by hand),
+    the registry wins and the mismatch is reported to the user.
+
+    The first time it sees a lanes folder it adopts the files' statuses
+    once ("bootstrap"), so existing notes or an imported vault keep their state.
+    Also holds small bits of plugin state (stale notices already given,
+    per-session snapshot fingerprints).
+    """
+
+    def __init__(self, path: Path | str):
+        self.path = Path(path).expanduser()
+        self.data = {"version": 1, "initialized": False, "status": {}, "stale_notified": {}, "sessions": {}}
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                for key in self.data:
+                    if isinstance(loaded.get(key), type(self.data[key])):
+                        self.data[key] = loaded[key]
+        except (OSError, ValueError):
+            pass
+
+    @property
+    def initialized(self) -> bool:
+        return bool(self.data.get("initialized"))
+
+    def get(self, slug: str) -> Optional[str]:
+        st = self.data["status"].get(slug)
+        return st if st in STATUSES else None
+
+    def set(self, slug: str, status: str, *, save: bool = True) -> None:
+        self.data["status"][slug] = status
+        if save:
+            self.save()
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".registry-", suffix=".tmp", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(self.data, fh, indent=1, sort_keys=True)
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
 class LaneStore:
-    def __init__(self, root: Path | str):
+    def __init__(self, root: Path | str, registry: Optional[Registry] = None):
         self.root = Path(root).expanduser()
+        self.registry = registry
 
     # -- io --------------------------------------------------------------
     def _ensure(self) -> None:
@@ -155,6 +216,7 @@ class LaneStore:
 
     def _write(self, lane: Lane) -> None:
         self._ensure()
+        lane.file_status = lane.status  # writing through the store repairs any hand-edited header
         target = self.root / f"{lane.slug}.md"
         fd, tmp = tempfile.mkstemp(prefix=".lane-", suffix=".tmp", dir=self.root)
         try:
@@ -169,17 +231,31 @@ class LaneStore:
             raise
 
     def all(self) -> list[Lane]:
-        if not self.root.is_dir():
-            return []
         lanes = []
-        for path in sorted(self.root.glob("*.md")):
-            if path.name.startswith(".") or path.name.lower() == "readme.md":
-                continue
-            try:
-                lanes.append(parse_lane(path))
-            except (OSError, UnicodeDecodeError):
-                continue
+        if self.root.is_dir():
+            for path in sorted(self.root.glob("*.md")):
+                if path.name.startswith(".") or path.name.lower() == "readme.md":
+                    continue
+                try:
+                    lanes.append(parse_lane(path))
+                except (OSError, UnicodeDecodeError):
+                    continue
+        reg = self.registry
+        if reg is None:
+            return lanes
+        if not reg.initialized:  # one-time adoption of whatever exists now (possibly nothing)
+            for ln in lanes:
+                reg.set(ln.slug, ln.status, save=False)
+            reg.data["initialized"] = True
+            reg.save()
+        for ln in lanes:
+            granted = reg.get(ln.slug)
+            # A file the registry has never seen is dormant, whatever its header says.
+            ln.status = granted or DORMANT
         return lanes
+
+    def mismatches(self) -> list[Lane]:
+        return [ln for ln in self.all() if ln.mismatch]
 
     def by_status(self, status: str) -> list[Lane]:
         lanes = [ln for ln in self.all() if ln.status == status]
@@ -245,7 +321,11 @@ class LaneStore:
             intro += f"{why.strip()}\n\n"
         verb = "captured" if status == DORMANT else f"created as {status}"
         lane.body = intro + f"{_LOG_HEADER}\n- {stamp.strftime(_TS_FMT)} · {verb}" + (f" ({source})" if source else "") + "\n"
+        if self.registry is not None:
+            self.all()  # make sure a fresh registry bootstraps before we add to it
+            self.registry.set(lane.slug, status)
         self._write(lane)
+        lane.file_status = status
         return lane
 
     def append_log(self, lane: Lane, kind: str, note: str, *, next_action: Optional[str] = None) -> Lane:
@@ -273,5 +353,7 @@ class LaneStore:
             raise LaneError(f"`{lane.slug}` is already {status}.")
         old = lane.status
         lane.status = status
+        if self.registry is not None:
+            self.registry.set(lane.slug, status)
         note = f"{old} → {status} by {actor}" + (f": {reason}" if reason else "")
         return self.append_log(lane, "status", note)

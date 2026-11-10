@@ -193,30 +193,32 @@ def _inside(path_text: str, root: Path) -> bool:
         return False
 
 
-def make_guard(get_settings: Callable[[], Settings]):
+def make_guard(get_roots: Callable[[], tuple]):
+    """``get_roots()`` returns ``(settings, [protected dirs])``: the lanes folder and
+    Lane Keeper's own data folder (where the status registry lives)."""
     def guard(tool_name: str = "", args: Optional[dict] = None, **kwargs):
         try:
-            s = get_settings()
+            s, roots = get_roots()
             if not s.guard_lane_files:
                 return None
             args = args or {}
-            root = s.lanes_dir
             if tool_name in _WRITE_TOOLS:
                 for key in ("path", "file_path", "target", "filename"):
-                    if args.get(key) and _inside(args[key], root):
+                    if args.get(key) and any(_inside(args[key], r) for r in roots):
                         return {"action": "block", "message": BLOCK_MESSAGE}
                 return None
             if tool_name in _SHELL_TOOLS:
                 cmd = str(args.get("command") or "")
                 if _SELF_SERVE.search(cmd):
                     return {"action": "block", "message": BLOCK_MESSAGE}
-                r = root.expanduser().resolve(strict=False)
-                forms = {str(root), str(r)}
+                forms: set[str] = set()
                 home = str(Path.home())
-                for f in list(forms):
-                    if f.startswith(home):
-                        forms.add("~" + f[len(home):])
-                        forms.add("$HOME" + f[len(home):])
+                for root in roots:
+                    for f in {str(root), str(root.expanduser().resolve(strict=False))}:
+                        forms.add(f)
+                        if f.startswith(home):
+                            forms.add("~" + f[len(home):])
+                            forms.add("$HOME" + f[len(home):])
                 if _writes_to(cmd, forms):
                     return {"action": "block", "message": BLOCK_MESSAGE}
             return None
