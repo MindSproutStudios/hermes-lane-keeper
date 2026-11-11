@@ -1,11 +1,11 @@
 name: lane-keeper
-version: "0.2.0"
+version: "0.2.1"
 manifest_version: 2
 api_version: 1
 description: "Keeps your agent on your few active lanes. New ideas are saved as dormant instead of quietly becoming work, only you can promote one, and stale active lanes get called out."
 author: Morris (MindSprout)
 license: MIT
-homepage: https://github.com/morrismindsprout-dev/hermes-lane-keeper
+homepage: https://github.com/MindSproutStudios/hermes-lane-keeper
 requires_hermes: ">=0.23.0"
 tags: [focus, projects, productivity, ideas, accountability]
 provides_tools:
@@ -47,3 +47,5 @@ config_schema:
     default: true
     label: "Guard lane files"
     description: "Block the agent from editing lane files or Lane Keeper's data through file or terminal tools. Status is always decided by the registry, not the files, either way."
+python_dependencies:
+  - "pyyaml>=6,<7"

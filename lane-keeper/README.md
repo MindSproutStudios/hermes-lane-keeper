@@ -115,7 +115,7 @@ Then start a new session and type `/lanes`.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install pytest pyyaml
-.venv/bin/python -m pytest              # 25 tests, including every gate path above
+.venv/bin/python -m pytest              # 26 tests, including every gate path above
 hermes plugins validate lane-keeper
 ```
 

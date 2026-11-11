@@ -360,3 +360,11 @@ def test_unattended_runs_get_no_lane_context(wired):
     section = wired.sections["lane-keeper"]
     assert section({"session_id": "c1", "platform": "cron"}) is None
     assert wired.hooks["pre_llm_call"](session_id="c1", platform="cron") is None
+
+
+def test_manifest_declares_every_third_party_import():
+    """Stock Hermes doesn't ship PyYAML, so plugin.yaml must declare it or the plugin won't load."""
+    root = Path(lane_keeper.__file__).parent
+    manifest = (root / "plugin.yaml").read_text(encoding="utf-8")
+    uses_yaml = any("import yaml" in p.read_text(encoding="utf-8") for p in root.glob("*.py"))
+    assert not uses_yaml or "pyyaml" in manifest.lower().split("python_dependencies:", 1)[-1]
